@@ -12,7 +12,7 @@
   },
   "engines": { "node": ">=20" },
   "dependencies": {
-    "@coinbase/cdp-sdk": "^1.39.0",
+    "@coinbase/cdp-sdk": "^1.55.0",
     "@modelcontextprotocol/sdk": "^1.20.2",
     "express": "^5.1.0",
     "pg": "^8.16.3",
