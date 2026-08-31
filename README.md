@@ -2,41 +2,140 @@
 
 **Your AI already knows what matters. Let it guard your inbox.**
 
-Inbox Goalie is a receiver-side ChatGPT/MCP plugin for turning unsolicited email into paid priority requests.
+Inbox Goalie is a receiver-side ChatGPT/MCP plugin for turning unsolicited email into paid priority requests. V0.2 replaces Stripe Connect with Base-native USDC settlement.
 
-V0.1 deliberately does one thing:
+## Current payment flow
 
-1. Receiver installs the MCP plugin.
-2. Receiver sets a priority price, e.g. $10.
-3. Receiver connects Stripe payouts.
-4. In ChatGPT, the receiver says: **“Goalie this email.”**
-5. Inbox Goalie creates a unique payment link and standardized reply.
-6. ChatGPT can use the reply with the user's email connector when the user authorizes sending.
-7. Sender pays.
-8. Stripe routes the receiver share to the receiver and the application fee to Inbox Goalie.
+```text
+Sender opens Goalie link
+        ↓
+Apple Pay / Google Pay via Coinbase Headless Onramp
+or card via Coinbase one-click Onramp Session
+        ↓
+Fiat becomes USDC on Base
+        ↓
+USDC lands in InboxGoaliePayments contract
+        ↓
+Backend independently verifies Coinbase/onchain settlement
+        ↓
+settlePayment(messageId, receiver, amount, feeBps)
+        ↓
+Receiver wallet gets its USDC share
+Inbox Goalie treasury gets the platform fee
+        ↓
+Message status becomes released
+```
 
-Payment buys **priority**, never a guaranteed read or reply.
+The sender does **not** create a Coinbase account, connect a crypto wallet, manage gas, bridge tokens, or handle seed phrases in the intended guest-checkout flow. The receiver supplies a Base-compatible wallet as the payout destination.
 
-## Why this version
+## Why there is a settlement contract
 
-No Gmail OAuth. No sender credits. No giant dashboard. No autonomous classifier.
+Coinbase Onramp can send USDC to a Base destination address, but a normal ERC-20 transfer into a contract does not invoke application logic. Inbox Goalie therefore receives the USDC at a minimal settlement contract and, after independent verification of the actual USDC transfer, an operator transaction calls `settlePayment`. The contract atomically sends the receiver share and treasury fee. Funds are intended to remain in the contract only for the verification/settlement window; Inbox Goalie does not maintain user credit balances in V1.
 
-ChatGPT is the intelligence layer. Gmail/Outlook remain the mailbox. Inbox Goalie is the gate + payment rail.
+## Receiver flow
 
-## MCP tools
+MCP tools:
 
-- `setup_receiver` — set receiver email and default price
-- `connect_payouts` — create/reuse a Stripe Express connected account and return onboarding URL
-- `create_goalie_request` — create a unique Goalie request and return the exact reply text + payment URL
-- `get_goalie_status` — check whether a sender paid
-- `list_goalie_requests` — inspect recent requests
+- `setup_receiver` — receiver email, price in USDC and fee basis points
+- `connect_payout_wallet` — store a Base-compatible payout wallet
+- `create_goalie_request` — create the sender payment link + Goalie reply
+- `get_goalie_status` — read provider/onchain/release status
+- `list_goalie_requests` — recent Goalie requests
 
-## Local setup
+Example economics with a $10 price and 20% fee:
+
+```text
+Gross settlement: 10 USDC
+Receiver:          8 USDC
+Inbox Goalie:      2 USDC
+```
+
+## Sender checkout
+
+The payment page exposes:
+
+- Pay with Apple Pay
+- Pay with Google Pay
+- Pay with Card
+
+Apple Pay / Google Pay use Coinbase's current Headless Onramp Order API. Card uses Coinbase's one-click Onramp Session API. Payment providers are behind the `PaymentProvider` interface in `src/payments/provider.ts`, so Transak, MoonPay, Ramp, or regional providers can be added without changing Goalie request logic.
+
+## Requirements and current Coinbase constraints
+
+Coinbase Headless Onramp currently supports guest Apple Pay and Google Pay and is currently US-only for Headless users. Web Apple Pay requires production access, an allow-listed/verified domain, and the required iframe/security setup. Coinbase's hosted Onramp Session API supports `CARD` and returns a single-use checkout URL.
+
+Coinbase sandbox Headless orders simulate success but do **not** create a real Base Sepolia USDC transfer. For contract development, deploy to Base Sepolia, use test USDC/faucet funds, and exercise the independent `/payments/verify/:requestId` path with a real Sepolia transaction hash. For production guest checkout, switch to Base mainnet configuration.
+
+## Database migration
+
+Existing installs should run:
+
+```bash
+psql "$DATABASE_URL" -f sql/migrations/002_base_payments.sql
+```
+
+The migration adds:
+
+- `receivers.payout_wallet_address`
+- `receivers.payout_chain`
+- `receivers.message_price_usdc`
+- `receivers.platform_fee_bps`
+- generalized `payments` table with provider IDs, Base transaction hashes, settlement transaction hashes and verification timestamps
+
+Old Stripe columns are retained only for rollback/history and are no longer read or written by V0.2. `src/stripe.ts` and the Stripe package dependency have been removed.
+
+## Environment
+
+Copy `.env.example` and configure:
+
+```bash
+BASE_CHAIN_ID=84532
+BASE_RPC_URL=...
+USDC_CONTRACT_ADDRESS=...
+INBOX_GOALIE_PAYMENT_CONTRACT_ADDRESS=...
+INBOX_GOALIE_TREASURY_ADDRESS=...
+SETTLEMENT_OPERATOR_PRIVATE_KEY=...
+
+CDP_API_KEY_ID=...
+CDP_API_KEY_SECRET=...
+COINBASE_WEBHOOK_SECRET=...
+COINBASE_ONRAMP_SANDBOX=true
+COINBASE_ONRAMP_DOMAIN=...
+PLATFORM_FEE_BPS=2000
+```
+
+Never commit the operator private key or CDP secrets.
+
+Base mainnet uses chain ID `8453`; Base Sepolia uses `84532`. Network selection is environment-driven.
+
+## Smart contract
+
+`contracts/InboxGoaliePayments.sol` supports:
+
+- USDC-only settlement
+- receiver destination
+- configurable fee per payment
+- unique `bytes32` payment/message ID
+- replay protection
+- `PaymentSettled` event
+- owner-controlled treasury/operator updates
+- state-before-transfer settlement to minimize reentrancy surface
+
+Deploy it with the correct USDC, treasury and operator addresses for the selected network. The sender never calls this contract and never needs ETH for gas; the backend settlement operator pays the settlement gas. A CDP Paymaster can be added later if operator gas sponsorship is useful, but it is not required to hide gas from senders.
+
+## Independent verification
+
+A redirect or frontend `payment complete` event never releases a message. The backend requires an actual successful Base transaction receipt containing a USDC `Transfer` to the configured Inbox Goalie payment contract for at least the expected amount, then submits the split transaction. Coinbase webhooks are authenticated with `X-Hook0-Signature` and are used as provider-side confirmation.
+
+## Local development
 
 ```bash
 cp .env.example .env
 npm install
 psql "$DATABASE_URL" -f sql/schema.sql
+psql "$DATABASE_URL" -f sql/migrations/002_base_payments.sql
+npm run typecheck
+npm test
 npm run dev
 ```
 
@@ -44,42 +143,14 @@ Health: `GET /health`
 
 MCP: `POST /mcp`
 
-## Stripe
-
-Create a Stripe account with Connect enabled.
-
-Set:
-
-```bash
-STRIPE_SECRET_KEY=sk_test_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-PLATFORM_FEE_BPS=3000
-```
-
-`PLATFORM_FEE_BPS=3000` means Inbox Goalie keeps 30% of the priority price before Stripe's applicable fees/Connect economics.
-
-Forward Stripe events locally:
-
-```bash
-stripe listen --forward-to localhost:3000/stripe/webhook
-```
-
-The webhook handles `checkout.session.completed` and marks the Goalie request paid.
-
 ## Connect to ChatGPT
 
-Deploy this server to a public HTTPS URL. Then add the MCP endpoint:
-
-```text
-https://YOUR-DOMAIN/mcp
-```
-
-OpenAI's plugin system uses MCP servers as the server-backed capability layer. This repo is intentionally tool-first with no custom ChatGPT UI yet.
+Deploy the server to public HTTPS, register `https://YOUR-DOMAIN/mcp` in ChatGPT developer mode, and package the included plugin metadata/skill.
 
 Suggested first conversation:
 
 ```text
-Set up Inbox Goalie for me at $10 per priority request.
+Set up Inbox Goalie for me at $10 per priority request and connect my Base wallet.
 ```
 
 Then:
@@ -88,61 +159,8 @@ Then:
 Goalie this email and give me the reply.
 ```
 
-When a Gmail/Outlook connector is available in the same ChatGPT conversation, the model can combine the mailbox context with the Inbox Goalie tools. Sending the email remains a separate email action and should require the user's authorization.
-
-## Receiver economics
-
-With a $10 Goalie fee and 30% platform fee:
-
-```text
-Sender pays:          $10.00
-Inbox Goalie fee:      $3.00
-Receiver allocation:   $7.00
-```
-
-Stripe fees and Connect pricing still apply according to your Stripe account and country.
-
-## Data model
-
-Only the minimum transaction metadata is stored:
-
-- receiver email/config
-- Stripe connected account ID
-- sender email/name
-- message subject/reference ID if supplied
-- request token
-- amount/status
-- Stripe session/payment IDs
-
-The repo does **not** copy or store mailbox bodies.
-
-## Next layer, only after validation
-
-If people actually install this and senders actually pay:
-
-- sender accounts
-- prepaid Goalie Credits
-- domain verification
-- agency wallets
-- receiver earnings dashboard
-- sender reputation graph
-- automatic Goalie policies
-- lower-cost micro-priority fees
-
-Do not build those until the core behavior is proven.
+Inbox Goalie stores transaction/message metadata, not mailbox bodies. Payment buys priority, never a guaranteed read or reply.
 
 ## License
 
 MIT
-
-## Plugin package
-
-This repository also contains the current OpenAI plugin package structure:
-
-```text
-.codex-plugin/plugin.json
-skills/inbox-goalie/SKILL.md
-.app.json.template
-```
-
-After the MCP server is deployed, register its `/mcp` URL in ChatGPT developer mode. ChatGPT will assign a `plugin_asdk_app...` technical ID. Copy `.app.json.template` to `.app.json`, replace the placeholder with that ID, and add `"apps": "./.app.json"` to `.codex-plugin/plugin.json` before packaging/publishing the complete plugin.
