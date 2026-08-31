@@ -1,0 +1,24 @@
+{
+  "name": "inbox-goalie",
+  "version": "0.1.0",
+  "description": "Guard your inbox with paid priority requests for unsolicited senders.",
+  "author": {
+    "name": "Inbox Goalie"
+  },
+  "license": "MIT",
+  "keywords": ["email", "inbox", "attention", "priority", "payments"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Inbox Goalie",
+    "shortDescription": "Make unsolicited senders pay for priority",
+    "longDescription": "Inbox Goalie helps you route unsolicited email into Requests and gives senders an optional paid path to priority. Payment never guarantees a read or reply.",
+    "developerName": "Inbox Goalie",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Set up Inbox Goalie for me at $10 per priority request.",
+      "Review my unread email and tell me which messages you would Goalie.",
+      "Goalie this email and give me the reply."
+    ]
+  }
+}
