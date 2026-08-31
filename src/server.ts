@@ -32,7 +32,7 @@ app.post("/coinbase/webhook", express.raw({ type: "application/json" }), async (
     }
     if (payment) {
       await query(`UPDATE payments SET provider_payload=$2::jsonb, provider_payment_id=COALESCE(provider_payment_id,$3), updated_at=now() WHERE id=$1`, [payment.id, flattened, providerId ?? null]);
-      if ((status.includes("COMPLETED") || txHash) && txHash) await finalizePayment(payment.goalie_request_id, txHash);
+      if ((status.includes("COMPLETED") || txHash) && txHash) await finalizePayment(payment.goalie_request_id, txHash, true);
     }
     res.json({ received: true });
   } catch (e: any) { res.status(500).send(e.message); }
@@ -67,29 +67,46 @@ app.post("/g/:token/pay/:method", async (req, res) => {
 });
 
 app.post("/payments/verify/:requestId", async (req, res) => {
+  const isMock = (process.env.PAYMENT_PROVIDER ?? "coinbase") === "mock";
+  const suppliedSecret = String(req.headers["x-inbox-goalie-verification-secret"] ?? "");
+  const expectedSecret = process.env.PAYMENT_VERIFICATION_SECRET ?? "";
+  if (!isMock && (!expectedSecret || !safeEqual(suppliedSecret, expectedSecret))) return res.status(403).json({ error: "Manual payment verification is disabled" });
   const txHash = String(req.body?.transaction_hash ?? "") as `0x${string}`;
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return res.status(400).json({ error: "Valid transaction_hash required" });
-  try { await finalizePayment(req.params.requestId, txHash); res.json({ verified: true, status: "released" }); }
+  try { await finalizePayment(req.params.requestId, txHash, false); res.json({ verified: true, status: "released" }); }
   catch (e: any) { res.status(400).json({ verified: false, error: e.message }); }
 });
 
 app.get("/payments/return/:requestId", (_req, res) => res.send(page("Payment submitted", `<p>Payment is being independently verified on Base. The message is not released until settlement is confirmed.</p>`)));
 
-async function finalizePayment(requestId: string, txHash: string) {
-  const r = await query<any>(`SELECT g.*, r.payout_wallet_address, r.platform_fee_bps FROM goalie_requests g JOIN receivers r ON r.id=g.receiver_id WHERE g.id=$1`, [requestId]);
+async function finalizePayment(requestId: string, txHash: string, providerConfirmed: boolean) {
+  const r = await query<any>(`SELECT g.*, r.payout_wallet_address, r.platform_fee_bps, p.id payment_id, p.provider, p.provider_payment_id FROM goalie_requests g JOIN receivers r ON r.id=g.receiver_id LEFT JOIN payments p ON p.goalie_request_id=g.id WHERE g.id=$1`, [requestId]);
   const item = r.rows[0];
   if (!item?.payout_wallet_address) throw new Error("Receiver wallet missing");
+  if (!item.payment_id) throw new Error("Payment record missing");
   if (["paid","released"].includes(item.status)) return;
+  if (item.provider === "coinbase" && !providerConfirmed && (process.env.PAYMENT_PROVIDER ?? "coinbase") !== "mock") throw new Error("Coinbase payment must be confirmed by an authenticated provider event");
+
+  const reused = await query<{ goalie_request_id: string }>(`SELECT goalie_request_id FROM payments WHERE lower(transaction_hash)=lower($1) AND goalie_request_id<>$2 LIMIT 1`, [txHash, requestId]);
+  if (reused.rows[0]) throw new Error("Base transaction hash has already been used for another Goalie payment");
+
   const verified = await verifyUsdcDeposit(txHash as `0x${string}`, String(item.amount_usdc));
   if (!verified) throw new Error("No matching USDC transfer to Inbox Goalie contract found on Base");
-  await query(`UPDATE payments SET transaction_hash=$2,status='verified',verified_at=now(),updated_at=now() WHERE goalie_request_id=$1`, [requestId, txHash]);
+
+  try {
+    await query(`UPDATE payments SET transaction_hash=$2,status='verified',verified_at=now(),updated_at=now() WHERE goalie_request_id=$1`, [requestId, txHash]);
+  } catch (error: any) {
+    if (String(error?.code) === "23505") throw new Error("Base transaction hash has already been claimed");
+    throw error;
+  }
+
   const settlementHash = await settlePayment(requestId, item.payout_wallet_address, String(item.amount_usdc), item.platform_fee_bps);
   await query(`UPDATE payments SET settlement_transaction_hash=$2,status='settled',settled_at=now(),updated_at=now() WHERE goalie_request_id=$1`, [requestId, settlementHash]);
   await query(`UPDATE goalie_requests SET status='released',paid_at=COALESCE(paid_at,now()),released_at=now() WHERE id=$1`, [requestId]);
 }
 
 function createMcpServer() {
-  const mcp = new McpServer({ name: "inbox-goalie", version: "0.2.0" });
+  const mcp = new McpServer({ name: "inbox-goalie", version: "0.2.1" });
   mcp.registerTool("setup_receiver", { title: "Set up Inbox Goalie receiver", description: "Set receiver email, Base payout wallet, message price and platform fee.", inputSchema: { email: z.string().email(), display_name: z.string().max(120).optional(), payout_wallet_address: z.string().optional(), price_usdc: z.number().min(1).max(100000).default(10), platform_fee_bps: z.number().int().min(0).max(10000).default(Number(process.env.PLATFORM_FEE_BPS ?? 2000)) } }, async ({ email, display_name, payout_wallet_address, price_usdc, platform_fee_bps }) => {
     if (payout_wallet_address && !isAddress(payout_wallet_address)) return errorResult("Invalid Base-compatible wallet address.");
     const r = await query<Receiver>(`INSERT INTO receivers(email,display_name,payout_wallet_address,payout_chain,message_price_usdc,platform_fee_bps) VALUES($1,$2,$3,'base',$4,$5) ON CONFLICT(email) DO UPDATE SET display_name=EXCLUDED.display_name,payout_wallet_address=COALESCE(EXCLUDED.payout_wallet_address,receivers.payout_wallet_address),message_price_usdc=EXCLUDED.message_price_usdc,platform_fee_bps=EXCLUDED.platform_fee_bps,updated_at=now() RETURNING *`, [email.toLowerCase(), display_name ?? null, payout_wallet_address ?? null, price_usdc.toFixed(6), platform_fee_bps]);
@@ -120,6 +137,7 @@ app.all("/mcp", async (req,res)=>{res.setHeader("Access-Control-Allow-Origin","*
 app.listen(port,()=>console.log(`Inbox Goalie listening on ${baseUrl}`));
 
 function verifyHook0(body:string, header:string, secret:string){try{if(!header||!secret)return false;const parts=Object.fromEntries(header.split(",").map((p)=>{const i=p.indexOf("=");return [p.slice(0,i),p.slice(i+1)];}));const t=parts.t,v0=parts.v0;if(!t||!v0||Math.abs(Date.now()/1000-Number(t))>300)return false;const expected=crypto.createHmac("sha256",secret).update(`${t}.${body}`).digest("hex");return crypto.timingSafeEqual(Buffer.from(expected,"hex"),Buffer.from(v0,"hex"));}catch{return false;}}
+function safeEqual(a:string,b:string){const aa=Buffer.from(a);const bb=Buffer.from(b);return aa.length===bb.length&&crypto.timingSafeEqual(aa,bb);}
 function payForm(token:string,method:string,label:string){return `<form method="POST" action="/g/${encodeURIComponent(token)}/pay/${method}"><button type="submit">${escapeHtml(label)}</button></form>`;}
 function result(structuredContent:Record<string,unknown>,text:string){return {structuredContent,content:[{type:"text" as const,text}]};}
 function errorResult(text:string){return {isError:true,content:[{type:"text" as const,text}]};}
