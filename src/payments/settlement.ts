@@ -1,6 +1,6 @@
-import { createPublicClient, createWalletClient, http, parseUnits, toHex, keccak256, decodeEventLog } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { createPublicClient, http, parseUnits, toHex, keccak256, decodeEventLog, encodeFunctionData } from "viem";
 import { base, baseSepolia } from "viem/chains";
+import { sendPrivyEvmTransaction } from "../wallets/privy.js";
 
 const erc20Abi = [{ type: "event", name: "Transfer", inputs: [
   { indexed: true, name: "from", type: "address" }, { indexed: true, name: "to", type: "address" }, { indexed: false, name: "value", type: "uint256" }
@@ -11,7 +11,7 @@ const settlementAbi = [{ type: "function", name: "settlePayment", stateMutabilit
 
 function config() {
   const chainId = Number(process.env.BASE_CHAIN_ID ?? 84532);
-  return { chain: chainId === 8453 ? base : baseSepolia, rpc: process.env.BASE_RPC_URL!, usdc: process.env.USDC_CONTRACT_ADDRESS as `0x${string}`, contract: process.env.INBOX_GOALIE_PAYMENT_CONTRACT_ADDRESS as `0x${string}` };
+  return { chainId, chain: chainId === 8453 ? base : baseSepolia, rpc: process.env.BASE_RPC_URL!, usdc: process.env.USDC_CONTRACT_ADDRESS as `0x${string}`, contract: process.env.INBOX_GOALIE_PAYMENT_CONTRACT_ADDRESS as `0x${string}` };
 }
 
 export async function verifyUsdcDeposit(txHash: `0x${string}`, expectedAmountUsdc: string) {
@@ -32,13 +32,19 @@ export async function verifyUsdcDeposit(txHash: `0x${string}`, expectedAmountUsd
 
 export async function settlePayment(requestId: string, receiver: `0x${string}`, amountUsdc: string, feeBps: number) {
   const c = config();
-  const key = process.env.SETTLEMENT_OPERATOR_PRIVATE_KEY as `0x${string}` | undefined;
-  if (!key) throw new Error("SETTLEMENT_OPERATOR_PRIVATE_KEY is required");
-  const account = privateKeyToAccount(key);
-  const wallet = createWalletClient({ account, chain: c.chain, transport: http(c.rpc) });
   const publicClient = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
   const paymentId = keccak256(toHex(requestId));
-  const hash = await wallet.writeContract({ address: c.contract, abi: settlementAbi, functionName: "settlePayment", args: [paymentId, receiver, parseUnits(amountUsdc, 6), feeBps] });
+  const data = encodeFunctionData({
+    abi: settlementAbi,
+    functionName: "settlePayment",
+    args: [paymentId, receiver, parseUnits(amountUsdc, 6), feeBps],
+  });
+  const { hash } = await sendPrivyEvmTransaction({
+    to: c.contract,
+    data,
+    chainId: c.chainId,
+    idempotencyKey: `goalie-settlement-${requestId}`,
+  });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`Settlement transaction failed: ${hash}`);
   return hash;
