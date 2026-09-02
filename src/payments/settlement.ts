@@ -36,8 +36,12 @@ export async function settlePayment(requestId: string, receiver: `0x${string}`, 
   if (!key) throw new Error("SETTLEMENT_OPERATOR_PRIVATE_KEY is required");
   const account = privateKeyToAccount(key);
   const wallet = createWalletClient({ account, chain: c.chain, transport: http(c.rpc) });
+  const publicClient = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
   const paymentId = keccak256(toHex(requestId));
-  return wallet.writeContract({ address: c.contract, abi: settlementAbi, functionName: "settlePayment", args: [paymentId, receiver, parseUnits(amountUsdc, 6), feeBps] });
+  const hash = await wallet.writeContract({ address: c.contract, abi: settlementAbi, functionName: "settlePayment", args: [paymentId, receiver, parseUnits(amountUsdc, 6), feeBps] });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") throw new Error(`Settlement transaction failed: ${hash}`);
+  return hash;
 }
 
 export function platformFeeUsdc(amountUsdc: string, feeBps: number) {
